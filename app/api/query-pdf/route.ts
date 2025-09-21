@@ -17,7 +17,6 @@ const pinecone = new Pinecone({
 
 const index = pinecone.Index(process.env.PINECONE_INDEX_NAME!);
 
-// Get the most recently uploaded document
 async function getMostRecentDocument(): Promise<string | null> {
   try {
     const dummyVector = new Array(384).fill(0);
@@ -69,7 +68,6 @@ async function getMostRecentDocument(): Promise<string | null> {
   }
 }
 
-// Search within a specific document
 async function searchInDocument(
   query: string,
   documentName: string
@@ -84,7 +82,6 @@ async function searchInDocument(
       normalize: true,
     });
 
-    // Search with document filter
     const result = await index.namespace("pdf-data").query({
       vector: Array.from(queryEmbedding.data),
       topK: 20,
@@ -101,7 +98,6 @@ async function searchInDocument(
   }
 }
 
-// Enhanced contextual search logic
 async function performContextualSearch(query: string, isGeneric: boolean) {
   console.log(
     `🔍 Performing ${
@@ -109,7 +105,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
     } search for: "${query}"`
   );
 
-  // Step 1: Get the most recent document
   const mostRecentDoc = await getMostRecentDocument();
 
   if (!mostRecentDoc) {
@@ -120,7 +115,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
   console.log(`📄 Context: Most recent upload is "${mostRecentDoc}"`);
 
   if (isGeneric) {
-    // For generic queries, ONLY search the most recent document
     console.log("🎯 GENERIC QUERY: Searching only in most recent document");
     const recentDocResult = await searchInDocument(query, mostRecentDoc);
 
@@ -132,11 +126,9 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
     };
   }
 
-  // For specific queries, search recent document first
   console.log("🎯 SPECIFIC QUERY: Searching recent document first...");
   const recentDocResult = await searchInDocument(query, mostRecentDoc);
 
-  // Check if we found good matches in the recent document
   const bestScoreInRecentDoc = Math.max(
     ...(recentDocResult.matches || []).map((m: any) => m.score || 0)
   );
@@ -146,7 +138,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
   );
 
   if (bestScoreInRecentDoc >= CONFIG.PRIMARY_DOCUMENT_THRESHOLD) {
-    // Good match found in recent document
     console.log(
       `✅ Found relevant content in recent document (score: ${bestScoreInRecentDoc.toFixed(
         3
@@ -161,7 +152,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
     };
   }
 
-  // Check if score is too low - suggest the content isn't in recent document
   if (bestScoreInRecentDoc < CONFIG.CONTEXT_SEARCH_THRESHOLD) {
     console.log(
       `⚠️ Low relevance in recent doc (${bestScoreInRecentDoc.toFixed(
@@ -169,7 +159,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
       )}) - might not contain this topic`
     );
 
-    // Search all documents to see if it exists elsewhere
     const extractor = await pipeline(
       "feature-extraction",
       "Xenova/all-MiniLM-L6-v2"
@@ -191,7 +180,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
     console.log(`📊 Best global score: ${bestGlobalScore.toFixed(3)}`);
 
     if (bestGlobalScore > CONFIG.PRIMARY_DOCUMENT_THRESHOLD) {
-      // Found better content in other documents
       const otherDocSources = [
         ...new Set(
           (globalResult.matches || [])
@@ -221,7 +209,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
         alternativeSources: otherDocSources,
       };
     } else {
-      // Topic not found anywhere
       console.log(`❌ Topic not found in any document`);
 
       return {
@@ -234,7 +221,6 @@ async function performContextualSearch(query: string, isGeneric: boolean) {
     }
   }
 
-  // Fallback: moderate score, return recent doc results
   return {
     matches: recentDocResult.matches || [],
     primarySource: mostRecentDoc,
@@ -272,7 +258,6 @@ export async function POST(req: NextRequest) {
     console.log("🔍 Query received:", query);
     const isGeneric = isGenericQuery(query);
 
-    // Perform contextual search
     const searchResult = await performContextualSearch(query, isGeneric);
 
     if (!searchResult) {
@@ -284,7 +269,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Handle special cases
     if (searchResult.topicNotFound) {
       return NextResponse.json({
         matchedChunks: [],
@@ -297,7 +281,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Process matches if found
     if (!searchResult.matches || searchResult.matches.length === 0) {
       return NextResponse.json({
         matchedChunks: [],
@@ -307,7 +290,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Select optimal chunks
     const finalChunks = selectOptimalChunks(
       searchResult.matches,
       CONFIG.MAX_CHUNKS,
@@ -361,13 +343,11 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// Helper function for chunk selection (same as before)
 function selectOptimalChunks(
   matches: any[],
   maxChunks: number,
   maxChars: number
 ): any[] {
-  // ... implementation from previous version
   return matches.slice(0, maxChunks).map((match) => ({
     text: match.metadata?.text || "",
     score: match.score || 0,
