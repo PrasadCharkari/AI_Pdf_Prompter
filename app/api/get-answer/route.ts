@@ -28,15 +28,16 @@ export async function POST(req: NextRequest) {
     }
 
     const queryData = await queryResponse.json();
-    const { matchedChunks, primarySource, queryInfo, sourceBreakdown } =
-      queryData;
+    const { matchedChunks, primarySource, queryInfo } = queryData;
 
     if (!matchedChunks || matchedChunks.length === 0) {
       return NextResponse.json({
-        answer:
-          "I couldn't find any relevant information in the uploaded PDFs to answer your question.",
+        answer: `I couldn't find any relevant information in your most recent document (${
+          primarySource || "unknown document"
+        }) to answer your question. You might want to try rephrasing your question or asking about different topics covered in this document.`,
         matchedChunks: [],
-        primarySource: null,
+        primarySource: primarySource,
+        queryInfo: queryInfo,
       });
     }
 
@@ -46,44 +47,38 @@ export async function POST(req: NextRequest) {
       })
       .join("\n\n---\n\n");
 
-    console.log("📝 Final context sources:", [
-      ...new Set(matchedChunks.map((c: any) => c.source)),
-    ]);
+    console.log("📝 Document being analyzed:", primarySource);
     console.log("📝 Context length:", contextWithSources.length);
+    console.log("📝 Chunks used:", matchedChunks.length);
 
     const prompt = `
-You are a helpful assistant analyzing PDF documents. Answer the user's question based on the provided context.
+You are a helpful assistant analyzing a PDF document. Answer the user's question based on the provided context from their most recently uploaded document.
 
-CONTEXT INFORMATION:
-- Primary document: "${primarySource}"
-- Query was: "${queryInfo?.original}"
-${
-  queryInfo?.analysis?.isGeneric
-    ? "- This appears to be a general question about the document content"
-    : "- This appears to be a specific question"
-}
-${
-  queryInfo?.enhanced && queryInfo.enhanced !== queryInfo.original
-    ? `- Enhanced query context: "${queryInfo.enhanced}"`
-    : ""
-}
+DOCUMENT INFORMATION:
+- Document: "${primarySource}"
+- This is the user's most recently uploaded PDF
+- Search quality: ${
+      queryInfo?.bestScore
+        ? `${(queryInfo.bestScore * 100).toFixed(1)}%`
+        : "Standard"
+    }
 
-Context from documents:
+Context from the document:
 ${contextWithSources}
 
-Original Question: ${question}
+User's Question: ${question}
 
 Instructions:
-- Answer based on the provided context, focusing primarily on the primary document: "${primarySource}"
+- Answer based ONLY on the provided context from "${primarySource}"
 - Be specific and cite relevant details from the text
-- If information comes from multiple documents, clearly indicate which document you're referencing
-- If the context doesn't fully answer the question, acknowledge what's missing
-- For general questions (summaries, bullet points, overviews), provide comprehensive coverage of the main topics
+- If the context doesn't fully answer the question, acknowledge what's missing and suggest the user might want to ask about other aspects of this document
+- Stay focused on this single document - do not speculate about information not present in the context
+- If the search quality seems low, mention that the user might want to rephrase their question for better results
 
 Answer:
 `.trim();
 
-    console.log("🔍 Sending to Claude with primary source:", primarySource);
+    console.log("🔍 Sending to Claude for document:", primarySource);
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
@@ -124,19 +119,17 @@ Answer:
     return NextResponse.json({
       answer: assistantMessage,
       primarySource: primarySource,
-      sourcesUsed: [...new Set(matchedChunks.map((c: any) => c.source))],
+      sourcesUsed: [primarySource],
       matchedChunks: matchedChunks,
       queryInfo: queryInfo,
-      totalDocumentsFound: sourceBreakdown?.length || 0,
+      searchStrategy: "recent_document_only",
       debugInfo: {
-        totalMatches: queryData.totalMatches,
+        document: primarySource,
         chunksUsed: matchedChunks.length,
-        documentRanking: sourceBreakdown,
-        queryEnhancement: {
-          original: queryInfo?.original,
-          enhanced: queryInfo?.enhanced,
-          wasGeneric: queryInfo?.analysis?.isGeneric,
-        },
+        searchQuality: queryInfo?.bestScore
+          ? `${(queryInfo.bestScore * 100).toFixed(1)}%`
+          : "N/A",
+        contextLength: contextWithSources.length,
       },
     });
   } catch (err: any) {
