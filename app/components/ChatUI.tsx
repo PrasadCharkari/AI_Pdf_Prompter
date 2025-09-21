@@ -75,8 +75,10 @@ export default function Chat({ chunks, initialMessage }: ChatProps) {
         setInput("");
         setLoading(true);
 
+        const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
+
         try {
-            const response = await fetch("/api/get-answer", {
+            const response = await fetch(`${baseUrl}/api/get-answer`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

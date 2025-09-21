@@ -13,18 +13,15 @@ export async function POST(req: NextRequest) {
 
     console.log("🔍 Question received:", question);
 
-    const queryResponse = await fetch(
-      `${
-        process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000"
-      }/api/query-pdf`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ query: question }),
-      }
-    );
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
+
+    const queryResponse = await fetch(`${baseUrl}/api/query-pdf`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query: question }),
+    });
 
     if (!queryResponse.ok) {
       throw new Error(`Query-PDF API error: ${queryResponse.status}`);

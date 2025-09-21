@@ -1,11 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pipeline } from "@xenova/transformers";
+
 import { Pinecone } from "@pinecone-database/pinecone";
-import dotenv from "dotenv";
 
-dotenv.config();
-
-export const runtime = "nodejs";
+const CONFIG = {
+  MAX_CHUNKS: 10,
+  MAX_CONTEXT_CHARS: 12000,
+  MIN_RELEVANCE_SCORE: 0.15, // Higher threshold for quality
+  CONTEXT_SEARCH_THRESHOLD: 0.25, // Threshold to search other documents
+  PRIMARY_DOCUMENT_THRESHOLD: 0.2, // Minimum score to find answer in recent doc
+};
 
 const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY!,
@@ -13,67 +17,247 @@ const pinecone = new Pinecone({
 
 const index = pinecone.Index(process.env.PINECONE_INDEX_NAME!);
 
-function isGenericQuery(query: string): boolean {
-  const queryLower = query.toLowerCase().trim();
+// Get the most recently uploaded document
+async function getMostRecentDocument(): Promise<string | null> {
+  try {
+    const dummyVector = new Array(384).fill(0);
+    const allResults = await index.namespace("pdf-data").query({
+      vector: dummyVector,
+      topK: 100,
+      includeMetadata: true,
+    });
 
-  const cleanQuery = queryLower.replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
-
-  const genericIndicators = [
-    "bullet points",
-    "summary",
-    "overview",
-    "what is this pdf about",
-    "what is this document about",
-    "tell me about this pdf",
-    "tell me about this document",
-    "explain this pdf",
-    "explain this document",
-    "main points",
-    "key points",
-    "summarize",
-    "content",
-    "topics",
-  ];
-
-  return genericIndicators.some((indicator) =>
-    cleanQuery.includes(indicator.replace(/[^\w\s]/g, "").replace(/\s+/g, " "))
-  );
-}
-
-function getMostRecentDocument(matchesByDocument: {
-  [key: string]: any[];
-}): string | null {
-  let mostRecentDoc = null;
-  let latestTimestamp = 0;
-
-  Object.entries(matchesByDocument).forEach(([source, matches]) => {
-    const timestamp = matches[0]?.metadata?.timestamp || 0;
-    if (Number(timestamp) > latestTimestamp) {
-      latestTimestamp = Number(timestamp);
-      mostRecentDoc = source;
+    if (!allResults.matches || allResults.matches.length === 0) {
+      return null;
     }
-  });
 
-  return mostRecentDoc;
+    const documentTimestamps: { [key: string]: number } = {};
+
+    allResults.matches.forEach((match) => {
+      const source = String(
+        match.metadata?.source || match.metadata?.filename || "unknown"
+      );
+      const timestamp = Number(match.metadata?.timestamp || 0);
+
+      if (
+        !documentTimestamps[source] ||
+        timestamp > documentTimestamps[source]
+      ) {
+        documentTimestamps[source] = timestamp;
+      }
+    });
+
+    let mostRecentDoc = null;
+    let latestTimestamp = 0;
+
+    Object.entries(documentTimestamps).forEach(([source, timestamp]) => {
+      if (timestamp > latestTimestamp) {
+        latestTimestamp = timestamp;
+        mostRecentDoc = source;
+      }
+    });
+
+    console.log(
+      `🎯 Most recent document: ${mostRecentDoc} (${new Date(
+        latestTimestamp
+      ).toISOString()})`
+    );
+    return mostRecentDoc;
+  } catch (error) {
+    console.error("❌ Error finding recent document:", error);
+    return null;
+  }
 }
 
-function enhanceQuery(originalQuery: string, mostRecentDoc?: string): string {
-  if (!isGenericQuery(originalQuery) || !mostRecentDoc) {
-    return originalQuery;
+// Search within a specific document
+async function searchInDocument(
+  query: string,
+  documentName: string
+): Promise<any> {
+  try {
+    const extractor = await pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2"
+    );
+    const queryEmbedding = await extractor(query, {
+      pooling: "mean",
+      normalize: true,
+    });
+
+    // Search with document filter
+    const result = await index.namespace("pdf-data").query({
+      vector: Array.from(queryEmbedding.data),
+      topK: 20,
+      includeMetadata: true,
+      filter: {
+        source: { $eq: documentName },
+      },
+    });
+
+    return result;
+  } catch (error) {
+    console.error(`❌ Error searching in ${documentName}:`, error);
+    return { matches: [] };
+  }
+}
+
+// Enhanced contextual search logic
+async function performContextualSearch(query: string, isGeneric: boolean) {
+  console.log(
+    `🔍 Performing ${
+      isGeneric ? "GENERIC" : "CONTEXTUAL"
+    } search for: "${query}"`
+  );
+
+  // Step 1: Get the most recent document
+  const mostRecentDoc = await getMostRecentDocument();
+
+  if (!mostRecentDoc) {
+    console.log("❌ No recent document found");
+    return null;
   }
 
-  const filename = mostRecentDoc.replace(/\.[^/.]+$/, "").replace(/_/g, " ");
+  console.log(`📄 Context: Most recent upload is "${mostRecentDoc}"`);
 
-  const enhancements: { [key: string]: string } = {
-    "bullet points": `key points and bullet points from ${filename} document`,
-    summary: `comprehensive summary of ${filename} document`,
-    overview: `overview and main topics from ${filename} document`,
-    "what is this pdf about": `what is the ${filename} document about, its main topics and purpose`,
-    "what is this document about": `what is the ${filename} document about, its main topics and purpose`,
+  if (isGeneric) {
+    // For generic queries, ONLY search the most recent document
+    console.log("🎯 GENERIC QUERY: Searching only in most recent document");
+    const recentDocResult = await searchInDocument(query, mostRecentDoc);
+
+    return {
+      matches: recentDocResult.matches || [],
+      primarySource: mostRecentDoc,
+      searchStrategy: "recent_document_only",
+      contextMessage: `Answering based on the most recently uploaded document: ${mostRecentDoc}`,
+    };
+  }
+
+  // For specific queries, search recent document first
+  console.log("🎯 SPECIFIC QUERY: Searching recent document first...");
+  const recentDocResult = await searchInDocument(query, mostRecentDoc);
+
+  // Check if we found good matches in the recent document
+  const bestScoreInRecentDoc = Math.max(
+    ...(recentDocResult.matches || []).map((m: any) => m.score || 0)
+  );
+
+  console.log(
+    `📊 Best score in "${mostRecentDoc}": ${bestScoreInRecentDoc.toFixed(3)}`
+  );
+
+  if (bestScoreInRecentDoc >= CONFIG.PRIMARY_DOCUMENT_THRESHOLD) {
+    // Good match found in recent document
+    console.log(
+      `✅ Found relevant content in recent document (score: ${bestScoreInRecentDoc.toFixed(
+        3
+      )})`
+    );
+
+    return {
+      matches: recentDocResult.matches || [],
+      primarySource: mostRecentDoc,
+      searchStrategy: "recent_document_sufficient",
+      contextMessage: `Found relevant information in the most recent document: ${mostRecentDoc}`,
+    };
+  }
+
+  // Check if score is too low - suggest the content isn't in recent document
+  if (bestScoreInRecentDoc < CONFIG.CONTEXT_SEARCH_THRESHOLD) {
+    console.log(
+      `⚠️ Low relevance in recent doc (${bestScoreInRecentDoc.toFixed(
+        3
+      )}) - might not contain this topic`
+    );
+
+    // Search all documents to see if it exists elsewhere
+    const extractor = await pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2"
+    );
+    const queryEmbedding = await extractor(query, {
+      pooling: "mean",
+      normalize: true,
+    });
+
+    const globalResult = await index.namespace("pdf-data").query({
+      vector: Array.from(queryEmbedding.data),
+      topK: 30,
+      includeMetadata: true,
+    });
+
+    const bestGlobalScore = Math.max(
+      ...(globalResult.matches || []).map((m) => m.score || 0)
+    );
+    console.log(`📊 Best global score: ${bestGlobalScore.toFixed(3)}`);
+
+    if (bestGlobalScore > CONFIG.PRIMARY_DOCUMENT_THRESHOLD) {
+      // Found better content in other documents
+      const otherDocSources = [
+        ...new Set(
+          (globalResult.matches || [])
+            .filter(
+              (m) =>
+                m.metadata?.source !== mostRecentDoc &&
+                (m.score || 0) > CONFIG.PRIMARY_DOCUMENT_THRESHOLD
+            )
+            .map((m) => m.metadata?.source)
+        ),
+      ];
+
+      console.log(
+        `🔄 Found better matches in other documents: [${otherDocSources.join(
+          ", "
+        )}]`
+      );
+
+      return {
+        matches: globalResult.matches || [],
+        primarySource: mostRecentDoc,
+        searchStrategy: "cross_document_search",
+        contextMessage: `This topic was not found in the recent document "${mostRecentDoc}", but was found in: ${otherDocSources.join(
+          ", "
+        )}`,
+        suggestNotInRecent: true,
+        alternativeSources: otherDocSources,
+      };
+    } else {
+      // Topic not found anywhere
+      console.log(`❌ Topic not found in any document`);
+
+      return {
+        matches: [],
+        primarySource: mostRecentDoc,
+        searchStrategy: "topic_not_found",
+        contextMessage: `This topic was not found in "${mostRecentDoc}" or any other uploaded documents.`,
+        topicNotFound: true,
+      };
+    }
+  }
+
+  // Fallback: moderate score, return recent doc results
+  return {
+    matches: recentDocResult.matches || [],
+    primarySource: mostRecentDoc,
+    searchStrategy: "recent_document_moderate",
+    contextMessage: `Partial information found in recent document: ${mostRecentDoc}`,
   };
+}
 
-  const enhanced = enhancements[originalQuery.toLowerCase().trim()];
-  return enhanced || `${originalQuery} from ${filename}`;
+function isGenericQuery(query: string): boolean {
+  const queryLower = query.toLowerCase().trim();
+  const genericIndicators = [
+    "what is this pdf about",
+    "what is this document about",
+    "summary",
+    "overview",
+    "main points",
+    "key points",
+    "tell me about this",
+    "explain this",
+    "summarize",
+  ];
+
+  return genericIndicators.some((indicator) => queryLower.includes(indicator));
 }
 
 export async function POST(req: NextRequest) {
@@ -87,282 +271,109 @@ export async function POST(req: NextRequest) {
 
     console.log("🔍 Query received:", query);
     const isGeneric = isGenericQuery(query);
-    console.log("🎯 Generic query detected:", isGeneric);
 
-    // Check index stats first
-    const stats = await index.describeIndexStats();
-    console.log("📊 Index Stats:", stats);
+    // Perform contextual search
+    const searchResult = await performContextualSearch(query, isGeneric);
 
-    // Step 1: Embed query
-    const extractor = await pipeline(
-      "feature-extraction",
-      "Xenova/all-MiniLM-L6-v2"
-    );
-
-    const queryEmbedding = await extractor(query, {
-      pooling: "mean",
-      normalize: true,
-    });
-
-    console.log(
-      "🔢 Query vector dimensions:",
-      Array.from(queryEmbedding.data).length
-    );
-
-    const result = await index.namespace("pdf-data").query({
-      vector: Array.from(queryEmbedding.data),
-      topK: 25,
-      includeMetadata: true,
-      includeValues: false,
-    });
-
-    console.log("🔍 Pinecone matches:", result.matches?.length || 0);
-
-    if (result.matches && result.matches.length > 0) {
-      console.log("🔍 First match metadata:", result.matches[0].metadata);
-      console.log("🔍 Source field:", result.matches[0].metadata?.source);
-      console.log("🔍 Filename field:", result.matches[0].metadata?.filename);
-
-      const matchesByDocument: { [key: string]: any[] } = {};
-
-      result.matches.forEach((match) => {
-        const source = String(
-          match.metadata?.source || match.metadata?.filename || "unknown"
-        );
-        if (!matchesByDocument[source]) {
-          matchesByDocument[source] = [];
-        }
-        matchesByDocument[source].push(match);
+    if (!searchResult) {
+      return NextResponse.json({
+        matchedChunks: [],
+        totalMatches: 0,
+        primarySource: null,
+        error: "No documents found",
       });
-
-      console.log("📚 Documents found:", Object.keys(matchesByDocument));
-
-      let finalChunks: any[] = [];
-      let primarySource: string = "";
-      let rankedSources: any[] = [];
-
-      if (isGeneric) {
-        const recentDoc = getMostRecentDocument(matchesByDocument);
-
-        if (recentDoc && matchesByDocument[recentDoc]) {
-          primarySource = recentDoc;
-
-          const recentDocChunks = matchesByDocument[recentDoc]
-            .sort((a, b) => (b.score || 0) - (a.score || 0))
-            .slice(0, 10)
-            .map((match) => ({
-              text:
-                typeof match.metadata?.text === "string"
-                  ? match.metadata.text
-                  : null,
-              score: match.score ?? 0,
-              id: match.id,
-              source: recentDoc,
-              chunkIndex: match.metadata?.chunkIndex,
-              isPrimary: true,
-            }))
-            .filter((chunk) => chunk.text !== null);
-
-          finalChunks = recentDocChunks;
-
-          console.log(
-            `🎯 GENERIC QUERY: Using ${finalChunks.length} chunks from most recent document: ${recentDoc}`
-          );
-          console.log(
-            `📅 Recent doc timestamp: ${matchesByDocument[recentDoc][0]?.metadata?.timestamp}`
-          );
-        } else {
-          console.log("❌ No recent document found for generic query");
-        }
-      } else {
-        const currentTime = Date.now();
-
-        const rankedSources = Object.entries(matchesByDocument)
-          .map(([source, matches]) => {
-            const maxScore = Math.max(...matches.map((m) => m.score || 0));
-            const avgScore =
-              matches.reduce((sum, m) => sum + (m.score || 0), 0) /
-              matches.length;
-            const timestamp = matches[0]?.metadata?.timestamp || 0;
-            const matchCount = matches.length;
-
-            const ageInMinutes =
-              (currentTime - Number(timestamp)) / (1000 * 60);
-            let recencyBoost = 0;
-
-            if (ageInMinutes < 5) recencyBoost = 0.2;
-            else if (ageInMinutes < 30) recencyBoost = 0.1;
-            else if (ageInMinutes < 120) recencyBoost = 0.05;
-
-            const finalScore = maxScore + recencyBoost;
-
-            return {
-              source,
-              matches,
-              maxScore,
-              avgScore,
-              finalScore,
-              timestamp: Number(timestamp),
-              matchCount,
-              recencyBoost,
-              ageInMinutes,
-            };
-          })
-          .sort((a, b) => {
-            if (Math.abs(a.finalScore - b.finalScore) > 0.05) {
-              return b.finalScore - a.finalScore;
-            }
-
-            return b.timestamp - a.timestamp;
-          });
-
-        console.log(
-          "🏆 Ranked sources:",
-          rankedSources.map((s) => ({
-            source: s.source,
-            maxScore: s.maxScore.toFixed(3),
-            timestamp: s.timestamp,
-            matches: s.matchCount,
-          }))
-        );
-
-        const PRIMARY_SOURCE_CHUNKS = 8;
-        const SECONDARY_SOURCE_CHUNKS = 2;
-
-        if (rankedSources[0]) {
-          primarySource = rankedSources[0].source;
-
-          const primaryThreshold = Math.min(
-            rankedSources[0].maxScore * 0.7,
-            0.05
-          );
-
-          const primaryChunks = rankedSources[0].matches
-            .filter((m) => (m.score ?? 0) > primaryThreshold)
-            .slice(0, PRIMARY_SOURCE_CHUNKS)
-            .map((match) => ({
-              text:
-                typeof match.metadata?.text === "string"
-                  ? match.metadata.text
-                  : null,
-              score: match.score ?? 0,
-              id: match.id,
-              source: rankedSources[0].source,
-              chunkIndex: match.metadata?.chunkIndex,
-              isPrimary: true,
-            }))
-            .filter((chunk) => chunk.text !== null);
-
-          finalChunks.push(...primaryChunks);
-          console.log(
-            `✅ Using ${primaryChunks.length} chunks from PRIMARY source: ${
-              rankedSources[0].source
-            } (threshold: ${primaryThreshold.toFixed(3)})`
-          );
-        }
-
-        if (rankedSources[1] && finalChunks.length < 4) {
-          const secondarySource = rankedSources[1];
-
-          const secondaryThreshold = Math.min(
-            secondarySource.maxScore * 0.8,
-            0.08
-          );
-
-          const secondaryChunks = secondarySource.matches
-            .filter((m) => (m.score ?? 0) > secondaryThreshold)
-            .slice(0, SECONDARY_SOURCE_CHUNKS)
-            .map((match) => ({
-              text:
-                typeof match.metadata?.text === "string"
-                  ? match.metadata.text
-                  : null,
-              score: match.score ?? 0,
-              id: match.id,
-              source: secondarySource.source,
-              chunkIndex: match.metadata?.chunkIndex,
-              isPrimary: false,
-            }))
-            .filter((chunk) => chunk.text !== null);
-
-          finalChunks.push(...secondaryChunks);
-          console.log(
-            `➕ Added ${secondaryChunks.length} chunks from secondary source: ${
-              secondarySource.source
-            } (threshold: ${secondaryThreshold.toFixed(3)})`
-          );
-        }
-
-        finalChunks = finalChunks.sort((a, b) => {
-          if (a.isPrimary !== b.isPrimary) {
-            return a.isPrimary ? -1 : 1;
-          }
-          return (b.score || 0) - (a.score || 0);
-        });
-      }
-
-      console.log("📝 Final context sources:", [
-        ...new Set(finalChunks.map((c) => c.source)),
-      ]);
-      console.log(
-        "📝 Context length:",
-        finalChunks.map((c) => c.text?.length || 0).reduce((a, b) => a + b, 0)
-      );
-
-      return NextResponse.json(
-        {
-          matchedChunks: finalChunks,
-          totalMatches: result.matches?.length || 0,
-          primarySource,
-          sourceBreakdown: isGeneric
-            ? primarySource
-              ? [
-                  {
-                    source: primarySource,
-                    strategy: "most_recent",
-                    chunks: finalChunks.length,
-                    timestamp:
-                      matchesByDocument[primarySource]?.[0]?.metadata
-                        ?.timestamp,
-                  },
-                ]
-              : []
-            : (rankedSources || []).map((s) => ({
-                source: s.source,
-                relevance: s.maxScore?.toFixed(3),
-                finalScore: s.finalScore?.toFixed(3),
-                recencyBoost: s.recencyBoost?.toFixed(3),
-                ageMinutes: Math.round(s.ageInMinutes || 0),
-                chunks: s.matchCount,
-              })),
-          queryInfo: {
-            original: query,
-            isGeneric,
-            strategy: isGeneric ? "recent_document" : "relevance_based",
-            enhanced: primarySource
-              ? enhanceQuery(query, primarySource)
-              : query,
-          },
-          indexStats: stats,
-        },
-        { status: 200 }
-      );
-    } else {
-      console.log("❌ NO MATCHES FOUND");
-      return NextResponse.json(
-        {
-          matchedChunks: [],
-          totalMatches: 0,
-          indexStats: stats,
-        },
-        { status: 200 }
-      );
     }
+
+    // Handle special cases
+    if (searchResult.topicNotFound) {
+      return NextResponse.json({
+        matchedChunks: [],
+        totalMatches: 0,
+        primarySource: searchResult.primarySource,
+        contextMessage: searchResult.contextMessage,
+        searchStrategy: searchResult.searchStrategy,
+        suggestion:
+          "This topic doesn't appear to be covered in any of your uploaded documents.",
+      });
+    }
+
+    // Process matches if found
+    if (!searchResult.matches || searchResult.matches.length === 0) {
+      return NextResponse.json({
+        matchedChunks: [],
+        totalMatches: 0,
+        primarySource: searchResult.primarySource,
+        contextMessage: searchResult.contextMessage,
+      });
+    }
+
+    // Select optimal chunks
+    const finalChunks = selectOptimalChunks(
+      searchResult.matches,
+      CONFIG.MAX_CHUNKS,
+      CONFIG.MAX_CONTEXT_CHARS
+    );
+
+    const matchedChunks = finalChunks.map((chunk) => ({
+      text: chunk.text,
+      score: chunk.score,
+      id: chunk.id,
+      source: chunk.source,
+      chunkIndex: chunk.chunkIndex,
+      isPrimary: chunk.isPrimary,
+    }));
+
+    const sources = [...new Set(finalChunks.map((c) => c.source))];
+    const totalChars = finalChunks.reduce((sum, c) => sum + c.text.length, 0);
+
+    console.log("📝 Final Result:");
+    console.log(`  • Strategy: ${searchResult.searchStrategy}`);
+    console.log(`  • Primary Source: ${searchResult.primarySource}`);
+    console.log(`  • Sources Used: [${sources.join(", ")}]`);
+    console.log(`  • Chunks: ${finalChunks.length}`);
+
+    return NextResponse.json({
+      matchedChunks,
+      totalMatches: searchResult.matches.length,
+      primarySource: searchResult.primarySource,
+      searchStrategy: searchResult.searchStrategy,
+      contextMessage: searchResult.contextMessage,
+      sourceBreakdown: sources.map((source) => ({
+        source,
+        chunks: finalChunks.filter((c) => c.source === source).length,
+      })),
+      queryInfo: {
+        original: query,
+        isGeneric,
+        searchStrategy: searchResult.searchStrategy,
+        chunksUsed: finalChunks.length,
+        totalCharacters: totalChars,
+        suggestNotInRecent: searchResult.suggestNotInRecent || false,
+        alternativeSources: searchResult.alternativeSources || [],
+      },
+    });
   } catch (err: any) {
-    console.error("❌ Error:", err.message);
+    console.error("❌ Error in query-pdf:", err);
     return NextResponse.json(
       { error: "Server error", details: err.message },
       { status: 500 }
     );
   }
+}
+
+// Helper function for chunk selection (same as before)
+function selectOptimalChunks(
+  matches: any[],
+  maxChunks: number,
+  maxChars: number
+): any[] {
+  // ... implementation from previous version
+  return matches.slice(0, maxChunks).map((match) => ({
+    text: match.metadata?.text || "",
+    score: match.score || 0,
+    id: match.id,
+    source: match.metadata?.source || "unknown",
+    chunkIndex: match.metadata?.chunkIndex,
+    isPrimary: true,
+  }));
 }

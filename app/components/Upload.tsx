@@ -84,8 +84,11 @@ export default function Upload({ onSuccess, onSummarize, onStartChat }: UploadPr
 
         setLoading(true);
 
+        const baseUrl =
+            process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
+
         try {
-            const res = await fetch("/api/parse-pdf", {
+            const res = await fetch(`${baseUrl}/api/parse-pdf`, {
                 method: "POST",
                 body: formData,
             });
